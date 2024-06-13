@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Recorder</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="box" id="connection-box">
+            <input type="text" id="ip-input" placeholder="Enter server IP address">
+            <button id="check-button">Check Server Connection</button>
+        </div>
+        <div class="box hidden" id="recording-box">
+            <label for="model-select">Choose a model:</label>
+            <select id="model-select">
+                <option value="tiny">Tiny</option>
+                <option value="base">Base</option>
+                <option value="small">Small</option>
+                <option value="medium">Medium</option>
+            </select>
+            <button id="set-model-button">Set Model</button>
+            <button id="record-button">Start Recording</button>
+            <button id="send-button">Send Recorded Audio</button>
+        </div>
+        <div class="box" id="output-box">
+            <h3>Server Output</h3>
+            <textarea id="output-label" readonly></textarea>
+        </div>
+        <div class="box" id="response-box">
+            <h3>Server Response</h3>
+            <div id="server-response" class="server-response"></div>
+            <div class="button-container">
+                <button id="increase-height">Increase Height</button>
+                <button id="decrease-height">Decrease Height</button>
+                <button id="copy-response-all">Copy All</button>
+                <button id="copy-response-last-10">Copy Last 10</button>
+                <button id="copy-response-last-50">Copy Last 50</button>
+            </div>
+        </div>
+        <div class="box" id="audio-visualizer">
+            <h3>Audio Visualizer</h3>
+            <canvas id="audio-canvas"></canvas>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
+
+<script>
+let serverUrl = "";
+let recording = false;
+let audioChunks = [];
+let mediaRecorder;
+let mediaStream;
+let audioContext;
+let analyser;
+let dataArray;
+let bufferLength;
+let dBLevels = [];
+let silenceThreshold = 0.3; // percentage of average dB
+let maxRecordingDuration = 30; // seconds
+
+// Canvas setup
+const canvas = document.getElementById('audio-canvas');
+const canvasCtx = canvas.getContext('2d');
+canvas.width = canvas.clientWidth;
+canvas.height = canvas.clientHeight;
+
+document.getElementById('check-button').addEventListener('click', checkServerConnection);
+document.getElementById('set-model-button').addEventListener('click', setModel);
+document.getElementById('record-button').addEventListener('click', toggleRecording);
+document.getElementById('send-button').addEventListener('click', prepareAudioForSending);
+
+document.getElementById('increase-height').addEventListener('click', () => adjustHeight('increase'));
+document.getElementById('decrease-height').addEventListener('click', () => adjustHeight('decrease'));
+document.getElementById('copy-response-all').addEventListener('click', () => copyLines('all', 'server-response'));
+document.getElementById('copy-response-last-10').addEventListener('click', () => copyLines(10, 'server-response'));
+document.getElementById('copy-response-last-50').addEventListener('click', () => copyLines(50, 'server-response'));
+
+async function checkServerConnection() {
+    const ipInput = document.getElementById('ip-input').value;
+    serverUrl = `http://${ipInput}:5000`;
+
+    try {
+        const response = await fetch(serverUrl + "/ping");
+        if (response.ok) {
+            updateOutput("Connected to server");
+            showRecordingControls();
+        } else {
+            updateOutput("Failed to connect to server");
+        }
+    } catch (error) {
+        updateOutput(`Connection error: ${error}`);
+        console.error('Error details:', error);
+    }
+}
+
+function showRecordingControls() {
+    document.getElementById('connection-box').style.display = 'none';
+    document.getElementById('recording-box').classList.remove('hidden');
+}
+
+async function setModel() {
+    const modelSelect = document.getElementById('model-select').value;
+    const response = await fetch(serverUrl + "/set_model", {
+        method: "POST",
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ model_name: modelSelect })
+    });
+
+    const result = await response.json();
+    updateOutput(result.message);
+}
+
+function toggleRecording() {
+    if (recording) {
+        stopRecording();
+    } else {
+        startRecording();
+    }
+}
+
+async function startRecording() {
+    if (!mediaStream) {
+        await getMicrophoneAccess();
+    }
+    recording = true;
+    document.getElementById('record-button').textContent = "Stop Recording";
+    audioChunks = [];
+
+    // Initialize MediaRecorder
+    mediaRecorder = new MediaRecorder(mediaStream);
+    mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+            audioChunks.push(event.data);
+        }
+    };
+    mediaRecorder.start();
+
+    // Initialize AudioContext
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    
+    // Create AnalyserNode
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    bufferLength = analyser.frequencyBinCount;
+    dataArray = new Uint8Array(bufferLength);
+
+    // Connect nodes
+    source.connect(analyser);
+
+    // Start drawing and monitoring dB level
+    draw();
+    monitorDBLevel();
+
+    updateOutput("Recording...");
+}
+
+function stopRecording() {
+    if (recording) {
+        recording = false;
+        document.getElementById('record-button').textContent = "Start Recording";
+        if (mediaRecorder) {
+            mediaRecorder.stop();
+        }
+        updateOutput("Recording stopped.");
+    }
+    stopMonitoringAudio();
+}
+
+function updateOutput(message) {
+    const outputLabel = document.getElementById('output-label');
+    outputLabel.value += `\n${message}`;
+    outputLabel.scrollTop = outputLabel.scrollHeight;
+}
+
+function updateServerResponse(message) {
+    const serverResponseElement = document.getElementById('server-response');
+    serverResponseElement.innerHTML += `<div>${message}</div>`;
+    serverResponseElement.scrollTop = serverResponseElement.scrollHeight;
+}
+
+function prepareAudioForSending() {
+    if (recording) {
+        mediaRecorder.onstop = () => {
+            sendAudio();
+            startRecording();
+        };
+        stopRecording();
+    } else {
+        sendAudio();
+    }
+}
+
+async function sendAudio() {
+    if (!audioChunks.length) {
+        updateOutput("No audio data to send");
+        return;
+    }
+
+    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+    const formData = new FormData();
+    formData.append('file', audioBlob, 'recorded_chunk.wav');
+
+    fetch(serverUrl + "/upload", {
+        method: "POST",
+        body: formData
+    })
+    .then(response => response.json())
+    .then(result => {
+        updateServerResponse(`Server response: ${result.transcription}`);
+    })
+    .catch(error => {
+        updateServerResponse(`Failed to send file: ${error}`);
+        console.error('Error details:', error);
+    });
+}
+
+async function getMicrophoneAccess() {
+    try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        updateOutput("Microphone access granted.");
+    } catch (error) {
+        updateOutput(`Microphone access denied: ${error}`);
+        console.error('Error details:', error);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', getMicrophoneAccess);
+
+function copyLines(lines, elementId) {
+    const element = document.getElementById(elementId);
+    let allLines = [];
+
+    if (elementId === 'output-label') {
+        allLines = element.value.trim().split('\n');
+    } else {
+        allLines = Array.from(element.children).map(child => child.innerText);
+    }
+
+    let linesToCopy;
+    if (lines === 'all') {
+        linesToCopy = allLines;
+    } else {
+        linesToCopy = allLines.slice(-lines);
+    }
+
+    const textToCopy = linesToCopy.join('\n');
+    navigator.clipboard.writeText(textToCopy).then(() => {
+        alert('Copied to clipboard');
+    }).catch(err => {
+        alert('Failed to copy text: ', err);
+    });
+}
+
+function adjustHeight(action) {
+    const serverResponse = document.getElementById('server-response');
+    const currentHeight = serverResponse.offsetHeight;
+    const newHeight = action === 'increase' ? currentHeight + 20 : currentHeight - 20;
+
+    if (newHeight >= 100 && newHeight <= 600) {
+        serverResponse.style.height = `${newHeight}px`;
+    }
+}
+
+function draw() {
+    if (!recording) return;
+
+    analyser.getByteFrequencyData(dataArray);
+
+    canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const barWidth = (canvas.width / bufferLength) * 2.5;
+    let x = 0;
+    let sumSquares = 0;
+
+    for (let i = 0; i < bufferLength; i++) {
+        const barHeight = dataArray[i];
+        sumSquares += barHeight * barHeight;
+
+        canvasCtx.fillStyle = `rgb(${barHeight + 100},50,50)`;
+        canvasCtx.fillRect(x, canvas.height - barHeight / 2, barWidth, barHeight / 2);
+
+        x += barWidth + 1;
+    }
+
+    // Calculate RMS and dB
+    const rms = Math.sqrt(sumSquares / bufferLength);
+    const db = 20 * Math.log10(rms / 255);
+
+    // Store dB level
+    dBLevels.push(db);
+
+    // Draw dB value
+    canvasCtx.fillStyle = 'white';
+    canvasCtx.font = '16px Arial';
+    canvasCtx.fillText(`dB: ${db.toFixed(2)}`, 10, 20);
+
+    requestAnimationFrame(draw);
+}
+
+function monitorDBLevel() {
+    const interval = setInterval(() => {
+        if (!recording) {
+            clearInterval(interval);
+            return;
+        }
+
+        if (dBLevels.length > 0) {
+            const avgDB = dBLevels.reduce((sum, level) => sum + level, 0) / dBLevels.length;
+            const currentDB = dBLevels[dBLevels.length - 1];
+            const silenceThresholdDB = avgDB * silenceThreshold;
+
+            // Debugging logs
+            console.log(`Average dB: ${avgDB}`);
+            console.log(`Current dB: ${currentDB}`);
+            console.log(`Silence Threshold dB: ${silenceThresholdDB}`);
+
+            if (currentDB < silenceThresholdDB && dBLevels.length > maxRecordingDuration) {
+                updateOutput("Detected significant drop in dB level, stopping recording...");
+                prepareAudioForSending();
+                clearInterval(interval);
+            }
+        }
+    }, 1000); // Check every second
+}
+
+function stopMonitoringAudio() {
+    if (audioContext) {
+        audioContext.close().then(() => {
+            audioContext = null;
+        });
+    }
+    canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+}
+</script>
+
+
+<style>
+
+#audio-canvas {
+    width: 100%;
+    height: 100px; /* Adjust height as needed */
+    background-color: #f0f0f0; /* Optional: background color */
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 90%;
+    max-width: 800px;
+    padding: 20px;
+    background-color: #ffffff;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.box {
+    width: 100%;
+    margin-bottom: 20px;
+    padding: 20px;
+    background-color: #f9f9f9;
+    border-radius: 10px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+#ip-input, button, #output-label, .server-response {
+    width: calc(100% - 22px);
+    max-width: 100%; 
+}
+
+#ip-input {
+    padding: 10px;
+    margin-bottom: 20px;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    box-sizing: border-box;
+}
+
+button {
+    padding: 10px 20px; 
+    margin: 10px 0;
+    border: none;
+    border-radius: 5px;
+    background-color: #007BFF;
+    color: white;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+button:hover {
+    background-color: #0056b3;
+}
+
+#output-label, .server-response {
+    height: 200px; 
+    margin-top: 10px;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    padding: 10px;
+    resize: vertical;
+}
+
+.server-response {
+    overflow-y: auto;
+    transition: height 0.3s;
+}
+
+.button-container {
+    display: flex;
+    justify-content: space-around;
+    margin-top: 10px;
+}
+
+.button-container button {
+    flex: 1;
+    margin: 0 5px;
+}
+
+@media (min-width: 600px) {
+    .container {
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-items: flex-start; 
+    }
+
+    .box {
+        width: calc(50% - 40px);
+        margin: 10px;
+    }
+}
+
+</style>
